@@ -2,27 +2,36 @@ import https from 'https';
 
 const agent = new https.Agent({
   rejectUnauthorized: false,
-  keepAlive: true,          // reutiliza conexões TCP = mais velocidade
+  keepAlive: true,
   keepAliveMsecs: 10000,
-  maxSockets: 100,          // mais conexões paralelas
+  maxSockets: 100,
   maxFreeSockets: 50,
 });
 
 export default async function handler(req, res) {
   const target = `https://137.131.176.224:443${req.url}`;
 
+  // Remove headers problemáticos
+  const { 
+    'transfer-encoding': _te,
+    'content-length': _cl,
+    host: _host,
+    ...safeHeaders 
+  } = req.headers;
+
   const options = {
     method: req.method,
     headers: {
+      ...safeHeaders,
       host: '137.131.176.224',
-      'content-type': req.headers['content-type'] || 'application/octet-stream',
-      'transfer-encoding': req.headers['transfer-encoding'] || '',
     },
     agent,
   };
 
   const proxyReq = https.request(target, options, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    // Remove também da resposta
+    const { 'transfer-encoding': _te2, ...safeResHeaders } = proxyRes.headers;
+    res.writeHead(proxyRes.statusCode, safeResHeaders);
     proxyRes.pipe(res, { end: true });
   });
 
@@ -35,6 +44,11 @@ export default async function handler(req, res) {
 }
 
 export const config = {
+  api: {
+    bodyParser: false,
+    responseLimit: false,
+  },
+};export const config = {
   api: {
     bodyParser: false,
     responseLimit: false,
