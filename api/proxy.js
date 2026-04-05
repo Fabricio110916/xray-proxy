@@ -9,7 +9,6 @@ const agent = new https.Agent({
   timeout: 60000,
 });
 
-// Headers que causam conflito ou overhead — remove antes de repassar
 const BLOCKED_HEADERS = new Set([
   'host', 'connection', 'x-forwarded-for',
   'x-forwarded-host', 'x-forwarded-proto',
@@ -20,7 +19,6 @@ const BLOCKED_HEADERS = new Set([
 export default async function handler(req, res) {
   const target = `https://137.131.176.224:443${req.url}`;
 
-  // Filtra headers problemáticos
   const cleanHeaders = Object.fromEntries(
     Object.entries(req.headers).filter(([k]) => !BLOCKED_HEADERS.has(k.toLowerCase()))
   );
@@ -37,13 +35,13 @@ export default async function handler(req, res) {
   };
 
   const proxyReq = https.request(target, options, (proxyRes) => {
+    // Força streaming sem buffer
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.setHeader('Cache-Control', 'no-store');
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
-
-    // Aumenta buffer do stream — menos chamadas de I/O
     proxyRes.pipe(res, { end: true, highWaterMark: 64 * 1024 });
   });
 
-  // TCP_NODELAY — desativa Nagle, reduz latência de pacotes pequenos
   proxyReq.on('socket', (socket) => {
     socket.setNoDelay(true);
     socket.setKeepAlive(true, 10000);
