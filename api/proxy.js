@@ -1,7 +1,7 @@
 import https from 'https';
 
 const agent = new https.Agent({
-  rejectUnauthorized: false, // ainda necessário Cloudflare→VPS
+  rejectUnauthorized: false,
   keepAlive: true,
   keepAliveMsecs: 10000,
   maxSockets: 100,
@@ -17,7 +17,7 @@ const BLOCKED_HEADERS = new Set([
 ]);
 
 export default async function handler(req, res) {
-  const target = `https://ws.koom.pp.ua${req.url}`;
+  const target = `https://137.131.176.224:443${req.url}`;
 
   const cleanHeaders = Object.fromEntries(
     Object.entries(req.headers).filter(([k]) => !BLOCKED_HEADERS.has(k.toLowerCase()))
@@ -27,7 +27,7 @@ export default async function handler(req, res) {
     method: req.method,
     headers: {
       ...cleanHeaders,
-      host: 'ws.koom.pp.ua',
+      host: '137.131.176.224',
       connection: 'keep-alive',
     },
     agent,
@@ -35,6 +35,7 @@ export default async function handler(req, res) {
   };
 
   const proxyReq = https.request(target, options, (proxyRes) => {
+    // Força streaming sem buffer
     res.setHeader('X-Accel-Buffering', 'no');
     res.setHeader('Cache-Control', 'no-store');
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
