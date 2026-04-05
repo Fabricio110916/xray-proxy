@@ -2,7 +2,7 @@ export const config = { runtime: 'edge' };
 
 export default async function handler(req) {
   const url = new URL(req.url);
-  url.hostname = 'ws.koom.pp.ua'; // domínio no Cloudflare
+  url.hostname = 'my.koom.pp.ua'; // domínio no Cloudflare
   url.port = '443';
   url.protocol = 'https:';
 
