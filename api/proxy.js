@@ -1,36 +1,21 @@
-import https from 'https';
-import http from 'http';
+// api/proxy.js — versão Edge otimizada
+export const config = { runtime: 'edge' };
 
-const agent = new https.Agent({ rejectUnauthorized: false });
+export default async function handler(req) {
+  const target = new URL(req.url);
+  target.hostname = '137.131.176.224';
+  target.port = '443';
+  target.protocol = 'https:';
 
-export default async function handler(req, res) {
-  const target = `https://137.131.176.224:443${req.url}`;
-
-  const options = {
+  const response = await fetch(target.toString(), {
     method: req.method,
-    headers: {
-      ...req.headers,
-      host: '137.131.176.224',
-    },
-    agent,
-  };
-
-  const proxyReq = https.request(target, options, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
-    proxyRes.pipe(res, { end: true });
+    headers: req.headers,
+    body: req.method !== 'GET' && req.method !== 'HEAD' ? req.body : undefined,
+    duplex: 'half',
   });
 
-  proxyReq.on('error', (err) => {
-    console.error('Proxy error:', err);
-    res.status(502).end('Bad Gateway');
+  return new Response(response.body, {
+    status: response.status,
+    headers: response.headers,
   });
-
-  req.pipe(proxyReq, { end: true });
 }
-
-export const config = {
-  api: {
-    bodyParser: false,    // necessário para streaming raw
-    responseLimit: false, // sem limite de tamanho
-  },
-};
