@@ -1,6 +1,6 @@
 import https from 'https';
 
-const TARGET_HOST = '137.131.176.224';
+const TARGET_HOST = 'my.koom.pp.ua';
 const TARGET_BASE = `https://${TARGET_HOST}:443`;
 
 const agent = new https.Agent({
