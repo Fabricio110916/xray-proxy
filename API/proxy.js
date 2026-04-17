@@ -12,7 +12,7 @@ const BLOCKED_HEADERS = new Set([
 export default async function handler(req) {
   const url = new URL(req.url);
   // O alvo agora utiliza o domínio my.koom.pp.ua em vez do IP direto
-  const target = https://`my.koom.pp.ua:443${url.pathname}${url.search}`;
+  const target = https://my.koom.pp.ua${url.pathname}${url.search}`;
 
   const newHeaders = new Headers();
   for (const [key, value] of req.headers.entries()) {
