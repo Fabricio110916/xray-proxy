@@ -1,6 +1,13 @@
-export const config = {
-  runtime: 'edge', 
-};
+import https from 'https';
+
+const agent = new https.Agent({
+  rejectUnauthorized: false,
+  keepAlive: true,
+  keepAliveMsecs: 10000,
+  maxSockets: 100,
+  maxFreeSockets: 50,
+  timeout: 60000,
+});
 
 const BLOCKED_HEADERS = new Set([
   'host', 'connection', 'x-forwarded-for',
@@ -9,48 +16,53 @@ const BLOCKED_HEADERS = new Set([
   'cdn-loop', 'cf-connecting-ip',
 ]);
 
-export default async function handler(req) {
-  const url = new URL(req.url);
-  // O alvo agora utiliza o domínio my.koom.pp.ua em vez do IP direto
-  const target = https://my.koom.pp.ua${url.pathname}${url.search}`;
+export default async function handler(req, res) {
+  const target = `https://my.koom.pp.ua:443${req.url}`;
 
-  const newHeaders = new Headers();
-  for (const [key, value] of req.headers.entries()) {
-    if (!BLOCKED_HEADERS.has(key.toLowerCase())) {
-      newHeaders.set(key, value);
-    }
-  }
-  
-  // Atualização do cabeçalho Host para coincidir com o novo domínio
-  newHeaders.set('host', 'my.koom.pp.ua');
-  newHeaders.set('connection', 'keep-alive');
+  const cleanHeaders = Object.fromEntries(
+    Object.entries(req.headers).filter(([k]) => !BLOCKED_HEADERS.has(k.toLowerCase()))
+  );
 
-  const init = {
+  const options = {
     method: req.method,
-    headers: newHeaders,
-    redirect: 'manual',
+    headers: {
+      ...cleanHeaders,
+      host: 'my.koom.pp.ua',
+      connection: 'keep-alive',
+    },
+    agent,
+    timeout: 60000,
   };
 
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
-    init.body = req.body;
-    init.duplex = 'half'; 
-  }
+  const proxyReq = https.request(target, options, (proxyRes) => {
+    // Força streaming sem buffer
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.setHeader('Cache-Control', 'no-store');
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res, { end: true, highWaterMark: 64 * 1024 });
+  });
 
-  try {
-    const response = await fetch(target, init);
+  proxyReq.on('socket', (socket) => {
+    socket.setNoDelay(true);
+    socket.setKeepAlive(true, 10000);
+  });
 
-    const responseHeaders = new Headers(response.headers);
-    responseHeaders.set('X-Accel-Buffering', 'no');
-    responseHeaders.set('Cache-Control', 'no-store');
+  proxyReq.on('timeout', () => {
+    proxyReq.destroy();
+    if (!res.headersSent) res.status(504).end('Gateway Timeout');
+  });
 
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: responseHeaders,
-    });
+  proxyReq.on('error', (err) => {
+    console.error('Proxy error:', err.message);
+    if (!res.headersSent) res.status(502).end('Bad Gateway');
+  });
 
-  } catch (error) {
-    console.error('Proxy error:', error.message);
-    return new Response('Bad Gateway', { status: 502 });
-  }
+  req.pipe(proxyReq, { end: true, highWaterMark: 64 * 1024 });
 }
+
+export const config = {
+  api: {
+    bodyParser: false,
+    responseLimit: false,
+  },
+};
