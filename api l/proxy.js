@@ -17,7 +17,7 @@ const BLOCKED_HEADERS = new Set([
 ]);
 
 export default async function handler(req, res) {
-  const target = `https://my.koom.pp.ua:443${req.url}`;
+  const target = `https://137.131.176.224:443${req.url}`;
 
   const cleanHeaders = Object.fromEntries(
     Object.entries(req.headers).filter(([k]) => !BLOCKED_HEADERS.has(k.toLowerCase()))
@@ -27,7 +27,7 @@ export default async function handler(req, res) {
     method: req.method,
     headers: {
       ...cleanHeaders,
-      host: 'my.koom.pp.ua',
+      host: '137.131.176.224',
       connection: 'keep-alive',
     },
     agent,
