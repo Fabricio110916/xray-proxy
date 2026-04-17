@@ -9,7 +9,6 @@ const agent = new https.Agent({
   keepAliveMsecs: 30000,
   maxSockets: 50,
   maxFreeSockets: 10,
-  timeout: 30000,
   scheduling: 'fifo',
 });
 
@@ -26,14 +25,10 @@ const BLOCKED_RES_HEADERS = new Set([
   'keep-alive', 'content-length',
 ]);
 
-// Detecta se é streaming longo (download de pacotes IP)
-// Autenticação é sempre POST — não deve ter heartbeat
 function isLongStream(req, resHeaders) {
-  if (req.method === 'POST') return false; // auth/upload nunca é stream longo
+  if (req.method === 'POST') return false;
   if (req.method !== 'GET') return false;
-
   const ct = (resHeaders['content-type'] || '').toLowerCase();
-  // stream longo tem content-type de bytes ou sem content-length definido
   return (
     ct.includes('octet-stream') ||
     ct.includes('stream') ||
@@ -85,11 +80,9 @@ export default async function handler(req, res) {
     const streaming = isLongStream(req, proxyRes.headers);
 
     if (streaming) {
-      // Só força chunked em streams longos
       safeHeaders['Transfer-Encoding'] = 'chunked';
       safeHeaders['Content-Type'] = safeHeaders['Content-Type'] || 'application/octet-stream';
     } else {
-      // Resposta normal (auth, upload) — deixa o content-length original se existir
       if (proxyRes.headers['content-length']) {
         safeHeaders['Content-Length'] = proxyRes.headers['content-length'];
       }
@@ -101,21 +94,14 @@ export default async function handler(req, res) {
     res.writeHead(proxyRes.statusCode, safeHeaders);
 
     if (streaming) {
-      heartbeatInterval = setInterval(() => {
-        if (!res.writableEnded) {
-          try { res.write(''); } catch { cleanup(); }
-        } else {
-          cleanup();
-        }
-      }, 5000);
-
+      // Pausa o stream upstream enquanto o cliente não está pronto
+      // Isso implementa backpressure correto e evita acúmulo em memória
       proxyRes.on('data', (chunk) => {
-        if (!res.writableEnded) {
-          try { res.write(chunk); } catch (err) {
-            console.error('stream write error:', err.message);
-            cleanup();
-            if (!proxyRes.destroyed) proxyRes.destroy();
-          }
+        const ok = res.write(chunk);
+        if (!ok) {
+          // Cliente está lento — pausa upstream até o drain
+          proxyRes.pause();
+          res.once('drain', () => proxyRes.resume());
         }
       });
 
@@ -124,8 +110,18 @@ export default async function handler(req, res) {
         if (!res.writableEnded) res.end();
       });
 
+      // Heartbeat espaçado — só para manter vivo, não interfere no tráfego
+      // Aumentado para 15s pois o tráfego real já mantém a conexão ativa
+      heartbeatInterval = setInterval(() => {
+        if (res.writableEnded) { cleanup(); return; }
+        // Só envia heartbeat se não houve escrita recente
+        if (!res.writableNeedDrain) {
+          try { res.write(Buffer.alloc(0)); } catch { cleanup(); }
+        }
+      }, 15000);
+
     } else {
-      // Auth/upload: pipe simples, sem heartbeat, fecha corretamente
+      // Auth/upload: pipe direto, máxima velocidade
       proxyRes.pipe(res, { end: true });
     }
 
@@ -150,8 +146,15 @@ export default async function handler(req, res) {
   });
 
   proxyReq.on('socket', (socket) => {
-    socket.setNoDelay(true);
+    socket.setNoDelay(true);          // desativa Nagle — envia chunks imediatamente
     socket.setKeepAlive(true, 30000);
+    // Buffer de socket maior para throughput alto
+    socket.on('connect', () => {
+      try {
+        socket.setRecvBufferSize?.(256 * 1024);  // 256KB recv buffer
+        socket.setSendBufferSize?.(256 * 1024);  // 256KB send buffer
+      } catch { /* não crítico */ }
+    });
   });
 
   proxyReq.on('error', (err) => {
@@ -159,7 +162,6 @@ export default async function handler(req, res) {
     cleanup();
     if (settled) return;
     settled = true;
-
     const status = err.message.includes('timeout') ? 504 : 502;
     const msg = err.message.includes('timeout') ? 'Gateway Timeout' : 'Bad Gateway';
     if (!res.headersSent) res.status(status).end(msg);
@@ -177,7 +179,13 @@ export default async function handler(req, res) {
     if (!settled && !proxyReq.destroyed) proxyReq.destroy();
   });
 
-  req.pipe(proxyReq, { end: true });
+  // Upload também com backpressure
+  proxyReq.on('drain', () => req.resume());
+  req.on('data', (chunk) => {
+    const ok = proxyReq.write(chunk);
+    if (!ok) req.pause();
+  });
+  req.on('end', () => proxyReq.end());
 }
 
 export const config = {
