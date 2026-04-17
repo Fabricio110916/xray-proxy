@@ -12,17 +12,18 @@ const agent = new https.Agent({
   scheduling: 'fifo',
 });
 
+// O Cloudflare passa esses headers pro upstream — vamos fazer o mesmo
 const BLOCKED_REQ_HEADERS = new Set([
   'host', 'connection', 'keep-alive',
   'transfer-encoding', 'content-length',
-  'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto',
+  // NÃO bloqueia x-forwarded-for — Cloudflare passa ele
+  'x-forwarded-host', 'x-forwarded-proto',
   'x-vercel-id', 'x-vercel-cache',
   'cdn-loop', 'cf-connecting-ip',
 ]);
 
 const BLOCKED_RES_HEADERS = new Set([
-  'transfer-encoding', 'connection',
-  'keep-alive', 'content-length',
+  'transfer-encoding', 'connection', 'keep-alive', 'content-length',
 ]);
 
 function isLongStream(req, resHeaders) {
@@ -46,12 +47,16 @@ export default async function handler(req, res) {
     }
   }
 
+  // Replica exatamente o que o Cloudflare envia pro upstream
   const options = {
     method: req.method,
     headers: {
       ...cleanHeaders,
-      host: TARGET_HOST,
-      connection: 'keep-alive',
+      'host': TARGET_HOST,
+      'connection': 'keep-alive',
+      // Cloudflare sempre adiciona esses dois
+      'x-real-ip': req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '',
+      'x-forwarded-for': req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '',
     },
     agent,
   };
@@ -82,24 +87,15 @@ export default async function handler(req, res) {
     if (streaming) {
       safeHeaders['Transfer-Encoding'] = 'chunked';
       safeHeaders['Content-Type'] = safeHeaders['Content-Type'] || 'application/octet-stream';
-    } else {
-      if (proxyRes.headers['content-length']) {
-        safeHeaders['Content-Length'] = proxyRes.headers['content-length'];
-      }
-    }
+      safeHeaders['X-Accel-Buffering'] = 'no';
+      safeHeaders['Cache-Control'] = 'no-store, no-cache';
 
-    safeHeaders['X-Accel-Buffering'] = 'no';
-    safeHeaders['Cache-Control'] = 'no-store, no-cache';
+      res.writeHead(proxyRes.statusCode, safeHeaders);
 
-    res.writeHead(proxyRes.statusCode, safeHeaders);
-
-    if (streaming) {
-      // Pausa o stream upstream enquanto o cliente não está pronto
-      // Isso implementa backpressure correto e evita acúmulo em memória
+      // Backpressure correto
       proxyRes.on('data', (chunk) => {
         const ok = res.write(chunk);
         if (!ok) {
-          // Cliente está lento — pausa upstream até o drain
           proxyRes.pause();
           res.once('drain', () => proxyRes.resume());
         }
@@ -110,18 +106,21 @@ export default async function handler(req, res) {
         if (!res.writableEnded) res.end();
       });
 
-      // Heartbeat espaçado — só para manter vivo, não interfere no tráfego
-      // Aumentado para 15s pois o tráfego real já mantém a conexão ativa
+      // Heartbeat leve — só mantém vivo, não interfere no tráfego
       heartbeatInterval = setInterval(() => {
         if (res.writableEnded) { cleanup(); return; }
-        // Só envia heartbeat se não houve escrita recente
         if (!res.writableNeedDrain) {
           try { res.write(Buffer.alloc(0)); } catch { cleanup(); }
         }
       }, 15000);
 
     } else {
-      // Auth/upload: pipe direto, máxima velocidade
+      // Auth/POST: sem buffering, pipe direto
+      safeHeaders['X-Accel-Buffering'] = 'no';
+      if (proxyRes.headers['content-length']) {
+        safeHeaders['Content-Length'] = proxyRes.headers['content-length'];
+      }
+      res.writeHead(proxyRes.statusCode, safeHeaders);
       proxyRes.pipe(res, { end: true });
     }
 
@@ -137,7 +136,9 @@ export default async function handler(req, res) {
     });
   });
 
-  proxyReq.setTimeout(20000, () => {
+  // Timeout generoso igual ao Cloudflare (que usa dias)
+  // No Vercel o máximo é 300s no free, 900s no Pro
+  proxyReq.setTimeout(280000, () => {
     if (!settled) {
       settled = true;
       cleanup();
@@ -146,13 +147,12 @@ export default async function handler(req, res) {
   });
 
   proxyReq.on('socket', (socket) => {
-    socket.setNoDelay(true);          // desativa Nagle — envia chunks imediatamente
+    socket.setNoDelay(true);
     socket.setKeepAlive(true, 30000);
-    // Buffer de socket maior para throughput alto
     socket.on('connect', () => {
       try {
-        socket.setRecvBufferSize?.(256 * 1024);  // 256KB recv buffer
-        socket.setSendBufferSize?.(256 * 1024);  // 256KB send buffer
+        socket.setRecvBufferSize?.(256 * 1024);
+        socket.setSendBufferSize?.(256 * 1024);
       } catch { /* não crítico */ }
     });
   });
@@ -179,7 +179,7 @@ export default async function handler(req, res) {
     if (!settled && !proxyReq.destroyed) proxyReq.destroy();
   });
 
-  // Upload também com backpressure
+  // Upload com backpressure
   proxyReq.on('drain', () => req.resume());
   req.on('data', (chunk) => {
     const ok = proxyReq.write(chunk);
