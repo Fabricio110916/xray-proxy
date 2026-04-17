@@ -26,6 +26,21 @@ const BLOCKED_RES_HEADERS = new Set([
   'keep-alive', 'content-length',
 ]);
 
+// Detecta se é streaming longo (download de pacotes IP)
+// Autenticação é sempre POST — não deve ter heartbeat
+function isLongStream(req, resHeaders) {
+  if (req.method === 'POST') return false; // auth/upload nunca é stream longo
+  if (req.method !== 'GET') return false;
+
+  const ct = (resHeaders['content-type'] || '').toLowerCase();
+  // stream longo tem content-type de bytes ou sem content-length definido
+  return (
+    ct.includes('octet-stream') ||
+    ct.includes('stream') ||
+    !resHeaders['content-length']
+  );
+}
+
 export default async function handler(req, res) {
   const target = `${TARGET_BASE}${req.url}`;
 
@@ -35,13 +50,6 @@ export default async function handler(req, res) {
       cleanHeaders[k] = v;
     }
   }
-
-  // Detecta se é uma requisição de streaming longa (XHTTP tunnel)
-  const isStreaming =
-    req.method === 'GET' ||
-    (req.headers['x-stream-mode'] === 'xhttp') ||
-    req.url?.includes('/xhttp') ||
-    req.url?.includes('/download');
 
   const options = {
     method: req.method,
@@ -74,51 +82,52 @@ export default async function handler(req, res) {
       }
     }
 
-    // CRÍTICO: força chunked encoding — mantém a conexão aberta no Vercel
-    safeHeaders['Transfer-Encoding'] = 'chunked';
+    const streaming = isLongStream(req, proxyRes.headers);
+
+    if (streaming) {
+      // Só força chunked em streams longos
+      safeHeaders['Transfer-Encoding'] = 'chunked';
+      safeHeaders['Content-Type'] = safeHeaders['Content-Type'] || 'application/octet-stream';
+    } else {
+      // Resposta normal (auth, upload) — deixa o content-length original se existir
+      if (proxyRes.headers['content-length']) {
+        safeHeaders['Content-Length'] = proxyRes.headers['content-length'];
+      }
+    }
+
     safeHeaders['X-Accel-Buffering'] = 'no';
     safeHeaders['Cache-Control'] = 'no-store, no-cache';
-    safeHeaders['Connection'] = 'keep-alive';
-
-    // Para streaming, força content-type que o Vercel não tenta bufferizar
-    if (isStreaming) {
-      safeHeaders['Content-Type'] = safeHeaders['Content-Type'] || 'application/octet-stream';
-    }
 
     res.writeHead(proxyRes.statusCode, safeHeaders);
 
-    if (isStreaming) {
-      // Heartbeat: envia chunk vazio a cada 5s para evitar timeout do Vercel
-      // O XHTTP ignora bytes nulos entre pacotes IP
+    if (streaming) {
       heartbeatInterval = setInterval(() => {
         if (!res.writableEnded) {
-          try {
-            res.write(''); // chunk vazio mantém a conexão viva
-          } catch {
-            cleanup();
-          }
+          try { res.write(''); } catch { cleanup(); }
         } else {
           cleanup();
         }
       }, 5000);
-    }
 
-    proxyRes.on('data', (chunk) => {
-      if (!res.writableEnded) {
-        try {
-          res.write(chunk);
-        } catch (err) {
-          console.error('write error:', err.message);
-          cleanup();
-          if (!proxyRes.destroyed) proxyRes.destroy();
+      proxyRes.on('data', (chunk) => {
+        if (!res.writableEnded) {
+          try { res.write(chunk); } catch (err) {
+            console.error('stream write error:', err.message);
+            cleanup();
+            if (!proxyRes.destroyed) proxyRes.destroy();
+          }
         }
-      }
-    });
+      });
 
-    proxyRes.on('end', () => {
-      cleanup();
-      if (!res.writableEnded) res.end();
-    });
+      proxyRes.on('end', () => {
+        cleanup();
+        if (!res.writableEnded) res.end();
+      });
+
+    } else {
+      // Auth/upload: pipe simples, sem heartbeat, fecha corretamente
+      proxyRes.pipe(res, { end: true });
+    }
 
     proxyRes.on('error', (err) => {
       console.error('proxyRes error:', err.message);
