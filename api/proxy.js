@@ -1,118 +1,173 @@
-import https from 'https';
+import http2 from 'http2';
 
-// Agent singleton — recriá-lo a cada request é um dos maiores causadores de instabilidade
-const agent = new https.Agent({
-  rejectUnauthorized: false,
-  keepAlive: true,
-  keepAliveMsecs: 30000,      // era 10s, aumentado para reduzir reconexões
-  maxSockets: 50,             // era 100, valor alto demais causa sobrecarga
-  maxFreeSockets: 10,         // era 50, mantém menos sockets ociosos
-  timeout: 30000,             // era 60s, timeout mais curto evita acúmulo de conexões presas
-  scheduling: 'fifo',         // garante ordem de uso dos sockets livres
-});
-
-const BLOCKED_HEADERS = new Set([
-  'host', 'connection', 'x-forwarded-for',
-  'x-forwarded-host', 'x-forwarded-proto',
-  'x-vercel-id', 'x-vercel-cache',
-  'cdn-loop', 'cf-connecting-ip',
-  'transfer-encoding',        // CRÍTICO: causava falhas de framing HTTP ao fazer pipe
-  'content-length',           // pode ficar inválido após remoção de headers
-]);
+// Sessão HTTP/2 persistente — reconecta automaticamente se cair
+let h2Session = null;
+let sessionPromise = null;
 
 const TARGET_HOST = '137.131.176.224';
-const TARGET_BASE = `https://${TARGET_HOST}:443`;
+const TARGET_URL = `https://${TARGET_HOST}`;
 const REQUEST_TIMEOUT_MS = 25000;
 
+function getSession() {
+  if (h2Session && !h2Session.destroyed && !h2Session.closed) {
+    return Promise.resolve(h2Session);
+  }
+
+  if (sessionPromise) return sessionPromise;
+
+  sessionPromise = new Promise((resolve, reject) => {
+    const session = http2.connect(TARGET_URL, {
+      rejectUnauthorized: false,
+      settings: {
+        initialWindowSize: 1024 * 1024,  // 1MB flow control window
+        maxConcurrentStreams: 100,
+      },
+    });
+
+    session.on('connect', () => {
+      console.log('HTTP/2 session established');
+      h2Session = session;
+      sessionPromise = null;
+      resolve(session);
+    });
+
+    session.on('error', (err) => {
+      console.error('H2 session error:', err.message);
+      h2Session = null;
+      sessionPromise = null;
+      reject(err);
+    });
+
+    session.on('close', () => {
+      console.warn('H2 session closed');
+      h2Session = null;
+      sessionPromise = null;
+    });
+
+    // GOAWAY = servidor pediu para parar de usar esta sessão
+    session.on('goaway', (errorCode) => {
+      console.warn('H2 GOAWAY received, code:', errorCode);
+      h2Session = null;
+      sessionPromise = null;
+      session.destroy();
+    });
+
+    // Ping periódico para manter a sessão viva
+    setInterval(() => {
+      if (h2Session && !h2Session.destroyed) {
+        h2Session.ping((err) => {
+          if (err) {
+            console.warn('H2 ping failed:', err.message);
+            h2Session?.destroy();
+          }
+        });
+      }
+    }, 20000);
+  });
+
+  return sessionPromise;
+}
+
+const BLOCKED_REQ_HEADERS = new Set([
+  'host', 'connection', 'keep-alive',
+  'transfer-encoding', 'upgrade',
+  'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto',
+  'x-vercel-id', 'x-vercel-cache',
+  'cdn-loop', 'cf-connecting-ip',
+  'http2-settings',  // não pode ser encaminhado em HTTP/2
+]);
+
+const BLOCKED_RES_HEADERS = new Set([
+  'connection', 'keep-alive', 'transfer-encoding',
+  'upgrade', 'proxy-connection',
+]);
+
 export default async function handler(req, res) {
-  const target = `${TARGET_BASE}${req.url}`;
+  let session;
+  try {
+    session = await getSession();
+  } catch (err) {
+    console.error('Failed to get H2 session:', err.message);
+    return res.status(502).json({ error: 'Bad Gateway', detail: 'H2 session failed' });
+  }
 
-  const cleanHeaders = Object.fromEntries(
-    Object.entries(req.headers)
-      .filter(([k]) => !BLOCKED_HEADERS.has(k.toLowerCase()))
-  );
-
-  const options = {
-    method: req.method,
-    headers: {
-      ...cleanHeaders,
-      host: TARGET_HOST,
-      connection: 'keep-alive',
-    },
-    agent,
-    // REMOVIDO: timeout aqui não funciona como esperado no https.request —
-    // ele mede inatividade do socket, não duração total. Use proxyReq.setTimeout()
+  // Monta headers HTTP/2 (pseudo-headers obrigatórios)
+  const reqHeaders = {
+    ':method': req.method,
+    ':path': req.url,
+    ':scheme': 'https',
+    ':authority': TARGET_HOST,
   };
 
-  // Aborta tudo se o cliente desconectar — evita requests órfãos acumulando
-  const abortController = new AbortController();
+  // Copia headers do cliente, removendo os bloqueados
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (!BLOCKED_REQ_HEADERS.has(k.toLowerCase())) {
+      reqHeaders[k] = v;
+    }
+  }
+
+  const h2Req = session.request(reqHeaders);
+
+  // Timeout de request
+  const timer = setTimeout(() => {
+    if (!h2Req.destroyed) {
+      h2Req.destroy(new Error('Request timeout'));
+    }
+  }, REQUEST_TIMEOUT_MS);
+
+  // Se cliente desconectar, cancela o stream H2
   req.on('close', () => {
-    if (!res.writableEnded) abortController.abort();
+    clearTimeout(timer);
+    if (!h2Req.destroyed) h2Req.destroy();
   });
 
-  let settled = false;
-  const settle = () => { settled = true; };
+  h2Req.on('response', (headers) => {
+    clearTimeout(timer);
 
-  const proxyReq = https.request(target, options, (proxyRes) => {
-    if (settled) {
-      proxyRes.resume(); // drena a resposta sem processar para liberar o socket
-      return;
+    const status = headers[':status'] ?? 502;
+
+    // Filtra headers de resposta, remove pseudo-headers e bloqueados
+    const safeHeaders = {};
+    for (const [k, v] of Object.entries(headers)) {
+      if (!k.startsWith(':') && !BLOCKED_RES_HEADERS.has(k.toLowerCase())) {
+        safeHeaders[k] = v;
+      }
     }
-    settle();
 
-    // Remove transfer-encoding da resposta — o Node já cuida do chunking
-    const safeHeaders = Object.fromEntries(
-      Object.entries(proxyRes.headers)
-        .filter(([k]) => k.toLowerCase() !== 'transfer-encoding')
-    );
+    safeHeaders['X-Accel-Buffering'] = 'no';
+    safeHeaders['Cache-Control'] = 'no-store';
 
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.setHeader('Cache-Control', 'no-store');
-    res.writeHead(proxyRes.statusCode, safeHeaders);
+    res.writeHead(status, safeHeaders);
 
-    proxyRes.on('error', (err) => {
-      console.error('proxyRes error:', err.message);
-      if (!res.writableEnded) res.end();
-    });
+    h2Req.pipe(res, { end: true });
 
-    // CORREÇÃO: highWaterMark fica no pipeline, não no pipe()
-    proxyRes.pipe(res, { end: true });
-
-    // Garante que a resposta seja liberada se o cliente sumir
     res.on('close', () => {
-      if (!proxyRes.destroyed) proxyRes.destroy();
+      if (!h2Req.destroyed) h2Req.destroy();
     });
   });
 
-  // setTimeout() é a forma correta de timeout no https.request
-  proxyReq.setTimeout(REQUEST_TIMEOUT_MS, () => {
-    if (!settled) {
-      settle();
-      proxyReq.destroy(new Error('Request timeout'));
-    }
-  });
-
-  proxyReq.on('socket', (socket) => {
-    socket.setNoDelay(true);
-    socket.setKeepAlive(true, 30000);
-  });
-
-  proxyReq.on('error', (err) => {
-    if (err.name === 'AbortError') return; // cliente desconectou, silencia
-    console.error('Proxy error:', err.message);
-    if (!settled) {
-      settle();
-      if (!res.headersSent) res.status(502).json({ error: 'Bad Gateway', detail: err.message });
-      else if (!res.writableEnded) res.end();
+  h2Req.on('error', (err) => {
+    clearTimeout(timer);
+    if (err.name === 'AbortError' || err.code === 'ERR_HTTP2_STREAM_CANCEL') return;
+    console.error('H2 stream error:', err.message);
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'Bad Gateway', detail: err.message });
+    } else if (!res.writableEnded) {
+      res.end();
     }
   });
 
   req.on('error', (err) => {
-    console.error('Request stream error:', err.message);
-    if (!proxyReq.destroyed) proxyReq.destroy();
+    console.error('Client req error:', err.message);
+    if (!h2Req.destroyed) h2Req.destroy();
   });
 
-  req.pipe(proxyReq, { end: true });
+  // Pipe do body (POST/PUT etc.), mas não trava em GET/HEAD
+  if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
+    req.pipe(h2Req, { end: true });
+  } else {
+    h2Req.end();
+  }
 }
 
 export const config = {
