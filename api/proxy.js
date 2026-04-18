@@ -3,7 +3,7 @@ import https from 'https';
 const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: true });
 
 export default function handler(req, res) {
-  const target = `https://137.131.176.224${req.url}`;
+  const target = `http://137.131.176.224${req.url}`;
 
   const skip = new Set(['host','connection','transfer-encoding','content-length',
     'x-forwarded-for','x-forwarded-host','x-forwarded-proto',
