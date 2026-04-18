@@ -1,56 +1,96 @@
-export const config = {
-  runtime: 'edge', 
-};
+import https from 'https';
+import http from 'http';
 
-const BLOCKED_HEADERS = new Set([
-  'host', 'connection', 'x-forwarded-for',
+const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: true });
+
+const SKIP = new Set([
   'x-forwarded-host', 'x-forwarded-proto',
-  'x-vercel-id', 'x-vercel-cache',
-  'cdn-loop', 'cf-connecting-ip',
+  'x-vercel-id', 'x-vercel-cache', 'cdn-loop',
+  'content-length', 'transfer-encoding',
 ]);
 
-export default async function handler(req) {
-  const url = new URL(req.url);
-  // O alvo agora utiliza o domínio my.koom.pp.ua em vez do IP direto
-  const target = https://`my.koom.pp.ua${url.pathname}${url.search}`;
+export default function handler(req, res) {
+  const target = `https://137.131.176.224${req.url}`;
 
-  const newHeaders = new Headers();
-  for (const [key, value] of req.headers.entries()) {
-    if (!BLOCKED_HEADERS.has(key.toLowerCase())) {
-      newHeaders.set(key, value);
-    }
+  const headers = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (!SKIP.has(k.toLowerCase())) headers[k] = v;
   }
-  
-  // Atualização do cabeçalho Host para coincidir com o novo domínio
-  newHeaders.set('host', 'my.koom.pp.ua');
-  newHeaders.set('connection', 'keep-alive');
+  headers['host'] = '137.131.176.224';
 
-  const init = {
-    method: req.method,
-    headers: newHeaders,
-    redirect: 'manual',
-  };
+  // Detecta WebSocket
+  const isWS = (req.headers['upgrade'] || '').toLowerCase() === 'websocket';
 
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
-    init.body = req.body;
-    init.duplex = 'half'; 
-  }
+  if (isWS) {
+    // Força headers de upgrade
+    headers['upgrade'] = 'websocket';
+    headers['connection'] = 'Upgrade';
 
-  try {
-    const response = await fetch(target, init);
+    const options = {
+      hostname: '137.131.176.224',
+      port: 443,
+      path: req.url,
+      method: 'GET',
+      headers,
+      agent,
+    };
 
-    const responseHeaders = new Headers(response.headers);
-    responseHeaders.set('X-Accel-Buffering', 'no');
-    responseHeaders.set('Cache-Control', 'no-store');
+    // Para WebSocket precisa pegar o socket raw
+    const proxyReq = https.request(options);
 
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: responseHeaders,
+    proxyReq.on('upgrade', (proxyRes, proxySocket, head) => {
+      // Monta resposta 101 para o cliente
+      let reply = 'HTTP/1.1 101 Switching Protocols\r\n';
+      for (const [k, v] of Object.entries(proxyRes.headers)) {
+        reply += `${k}: ${v}\r\n`;
+      }
+      reply += '\r\n';
+
+      const clientSocket = res.socket;
+      clientSocket.write(reply);
+
+      if (head && head.length) proxySocket.unshift(head);
+
+      // Tunel bidirecional raw
+      proxySocket.pipe(clientSocket);
+      clientSocket.pipe(proxySocket);
+
+      proxySocket.on('error', () => clientSocket.destroy());
+      clientSocket.on('error', () => proxySocket.destroy());
+      proxySocket.on('close', () => clientSocket.destroy());
+      clientSocket.on('close', () => proxySocket.destroy());
     });
 
-  } catch (error) {
-    console.error('Proxy error:', error.message);
-    return new Response('Bad Gateway', { status: 502 });
+    proxyReq.on('error', (err) => {
+      console.error('WS proxy error:', err.message);
+      res.socket?.destroy();
+    });
+
+    proxyReq.end();
+
+  } else {
+    // HTTP normal com suporte a streaming
+    const proxy = https.request(target, { method: req.method, headers, agent }, (upstream) => {
+      const resHeaders = {};
+      for (const [k, v] of Object.entries(upstream.headers)) {
+        if (k !== 'transfer-encoding' && k !== 'content-length') resHeaders[k] = v;
+      }
+      resHeaders['transfer-encoding'] = 'chunked';
+      resHeaders['x-accel-buffering'] = 'no';
+
+      res.writeHead(upstream.statusCode, resHeaders);
+
+      upstream.on('data', (chunk) => { if (!res.write(chunk)) upstream.pause(); });
+      upstream.on('end', () => res.end());
+      res.on('drain', () => upstream.resume());
+      res.on('close', () => upstream.destroy());
+    });
+
+    proxy.setTimeout(280000, () => proxy.destroy());
+    proxy.on('error', () => { if (!res.headersSent) res.status(502).end('Bad Gateway'); });
+
+    req.pipe(proxy);
   }
 }
+
+export const config = { api: { bodyParser: false, responseLimit: false } };
