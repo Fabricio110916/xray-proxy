@@ -3,7 +3,7 @@ import https from 'https';
 const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: true });
 
 export default function handler(req, res) {
-  const target = `https://137.131.176.224${req.url}`;
+  const target = `https://my.koom.pp.ua${req.url}`;
 
   const skip = new Set(['host','connection','transfer-encoding','content-length',
     'x-forwarded-for','x-forwarded-host','x-forwarded-proto',
@@ -13,7 +13,7 @@ export default function handler(req, res) {
   for (const [k, v] of Object.entries(req.headers)) {
     if (!skip.has(k.toLowerCase())) headers[k] = v;
   }
-  headers.host = '137.131.176.224';
+  headers.host = 'my.koom.pp.ua';
 
   const proxy = https.request(target, { method: req.method, headers, agent }, (upstream) => {
     const resHeaders = {};
