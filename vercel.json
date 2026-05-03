@@ -1,7 +1,20 @@
 {
-  "functions": {
-    "app/[[...slug]]/route.js": {
-      "maxDuration": 300
+  "version": 2,
+  "rewrites": [
+    {
+      "source": "/2053/cisco/:path*",
+      "destination": "/api/proxy"
     }
-  }
+  ],
+  "headers": [
+    {
+      "source": "/2053/cisco/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-cache, no-store, must-revalidate"
+        }
+      ]
+    }
+  ]
 }
