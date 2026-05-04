@@ -3,7 +3,7 @@
   "rewrites": [
     {
       "source": "/2053/cisco/:path*",
-      "destination": "/api/proxy"
+      "destination": "/api/proxy/:path*"
     }
   ],
   "headers": [
