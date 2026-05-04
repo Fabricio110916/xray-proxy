@@ -1,49 +1,50 @@
 export const config = {
-  runtime: 'nodejs', // mais estável pra túnel
+  runtime: 'nodejs',
 };
 
 export default async function handler(req, res) {
   try {
-    const TARGET_HOST = 'my.koom.pp.ua';
-    const TARGET_URL = `https://${TARGET_HOST}`;
+    const TARGET = 'https://my.koom.pp.ua';
 
     const url = new URL(req.url, `http://${req.headers.host}`);
+    const path = url.pathname.replace(/^\/api\/proxy/, '') + url.search;
+    const targetUrl = TARGET + path;
 
-    const targetPath = url.pathname.replace('/api/proxy', '') + url.search;
-    const targetUrl = TARGET_URL + targetPath;
-
-    const headers = { ...req.headers };
-
-    headers['host'] = TARGET_HOST;
-    headers['x-forwarded-host'] = TARGET_HOST;
-
-    delete headers['x-vercel-id'];
-    delete headers['x-vercel-deployment-url'];
-    delete headers['x-vercel-forwarded-for'];
-
-    const fetchOptions = {
-      method: req.method,
-      headers,
-      body: req.method !== 'GET' && req.method !== 'HEAD' ? req : undefined,
-      redirect: 'manual',
+    // 🔥 Headers camuflados estilo Injector
+    const headers = {
+      ...req.headers,
+      host: 'my.koom.pp.ua',
+      origin: 'https://www.google.com',
+      referer: 'https://www.google.com/',
+      'user-agent':
+        req.headers['user-agent'] ||
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      'x-forwarded-host': 'my.koom.pp.ua',
+      'x-real-ip': req.socket?.remoteAddress || '1.1.1.1',
     };
 
-    const response = await fetch(targetUrl, fetchOptions);
+    // limpa lixo da Vercel
+    delete headers['x-vercel-id'];
+    delete headers['x-vercel-forwarded-for'];
+
+    const response = await fetch(targetUrl, {
+      method: req.method,
+      headers,
+      body:
+        req.method !== 'GET' && req.method !== 'HEAD' ? req : undefined,
+      redirect: 'manual',
+    });
 
     res.status(response.status);
 
-    response.headers.forEach((value, key) => {
-      if (key.toLowerCase() !== 'content-encoding') {
-        res.setHeader(key, value);
+    response.headers.forEach((v, k) => {
+      if (!['content-encoding', 'transfer-encoding'].includes(k.toLowerCase())) {
+        res.setHeader(k, v);
       }
     });
 
     response.body.pipe(res);
-
-  } catch (error) {
-    res.status(502).json({
-      error: 'Proxy error',
-      message: error.message,
-    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
   }
 }
