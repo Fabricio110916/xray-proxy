@@ -2,19 +2,8 @@
   "version": 2,
   "rewrites": [
     {
-      "source": "/2053/cisco/:path*",
+      "source": "/:path*",
       "destination": "/api/proxy/:path*"
-    }
-  ],
-  "headers": [
-    {
-      "source": "/2053/cisco/:path*",
-      "headers": [
-        {
-          "key": "Cache-Control",
-          "value": "no-cache, no-store, must-revalidate"
-        }
-      ]
     }
   ]
 }
